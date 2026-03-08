@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Dynamic Hand Tracking - Destructive Forces</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #010103; font-family: 'Segoe UI', Tahoma, sans-serif; }
+        #video { display: none; }
+        #ui { position: absolute; top: 20px; left: 20px; color: #fff; pointer-events: none; z-index: 10; text-shadow: 1px 1px 4px #000;}
+        .highlight { color: #ff3333; font-weight: bold; }
+        h2 { margin-top: 0; letter-spacing: 1px; color: #ffaa00; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+</head>
+<body>
+    <div id="ui">
+        <h2>Destructive Particle Engine</h2>
+        <p>Sensors: <span id="status" class="highlight">Calibrating AI...</span></p>
+        <p>Current Force: <span id="shape-name" class="highlight">Volcano</span></p>
+        <p>Telemetry Controls:<br>
+           - 1 Finger: Volcano | 2 Fingers: Firing Asteroid<br>
+           - 3 Fingers: Saturn | 4+ Fingers: Black Hole<br>
+           - Pinch (Thumb & Index) to Control Intensity/Expansion</p>
+    </div>
+    
+    <video id="video" autoplay playsinline></video>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { FilesetResolver, HandLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/vision_bundle.mjs';
+
+        // --- 1. THREE.JS SETUP ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x010103, 0.015);
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 45;
+        camera.position.y = 5;
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        // Use Additive Blending for fire/glow effects
+        renderer.setBlendMode = THREE.AdditiveBlending;
+        document.body.appendChild(renderer.domElement);
+
+        // --- 2. PARTICLE SYSTEM & SHAPE TEMPLATES ---
+        const PARTICLE_COUNT = 15000;
+        const geometry = new THREE.BufferGeometry();
+        const currentPositions = new Float32Array(PARTICLE_COUNT * 3);
+        const currentColors = new Float32Array(PARTICLE_COUNT * 3);
+        
+        const templates = {
+            volcano: { pos: new Float32Array(PARTICLE_COUNT * 3), col: new Float32Array(PARTICLE_COUNT * 3) },
+            asteroid: { pos: new Float32Array(PARTICLE_COUNT * 3), col: new Float32Array(PARTICLE_COUNT * 3) },
+            saturn: { pos: new Float32Array(PARTICLE_COUNT * 3), col: new Float32Array(PARTICLE_COUNT * 3) },
+            blackhole: { pos: new Float32Array(PARTICLE_COUNT * 3), col: new Float32Array(PARTICLE_COUNT * 3) }
+        };
+
+        const colorLava = new THREE.Color(0xff2200);
+        const colorAsh = new THREE.Color(0x333333);
+        const colorFire = new THREE.Color(0xffaa00);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            let ix = i * 3;
+            
+            // --- VOLCANO ---
+            if (i < PARTICLE_COUNT * 0.4) { 
+                // Mountain Cone
+                let h = (Math.random() * 15) - 10; // Base from y=-10 to y=5
+                let radius = (5 - h) * 1.2 + (Math.random() * 1.5); // Wider at bottom
+                let angle = Math.random() * Math.PI * 2;
+                templates.volcano.pos[ix] = radius * Math.cos(angle);
+                templates.volcano.pos[ix+1] = h;
+                templates.volcano.pos[ix+2] = radius * Math.sin(angle);
+                
+                // Color mountain dark rocky ash with streaks of lava
+                let mix = Math.random() > 0.85 ? colorLava : colorAsh;
+                mix.clone().multiplyScalar(0.5 + Math.random() * 0.5).toArray(templates.volcano.col, ix);
+            } else { 
+                // Eruption Plume
+                let h = 5 + Math.random() * 25; // Shoots up to y=30
+                // Plume spreads out as it goes higher (parabola)
+                let radius = Math.pow((h - 5) * 0.8, 1.2) * Math.random(); 
+                let angle = Math.random() * Math.PI * 2;
+                templates.volcano.pos[ix] = radius * Math.cos(angle);
+                templates.volcano.pos[ix+1] = h;
+                templates.volcano.pos[ix+2] = radius * Math.sin(angle);
+                
+                // Bright yellow/orange at base, cooling to dark red/smoke at top
+                let heat = 1.0 - ((h - 5) / 25);
+                new THREE.Color().setHSL(0.1 * heat, 1.0, 0.2 + (heat * 0.5)).toArray(templates.volcano.col, ix);
+            }
+
+            // --- FIRING ASTEROID ---
+            if (i < PARTICLE_COUNT * 0.25) { 
+                // Asteroid Core (Front)
+                let u = Math.random(), v = Math.random();
+                let theta = u * 2.0 * Math.PI;
+                let phi = Math.acos(2.0 * v - 1.0);
+                let rAst = 5 + (Math.random() * 1.5); // Bumpy rock
+                // Offset the core to the right (x = 15)
+                templates.asteroid.pos[ix] = 15 + rAst * Math.sin(phi) * Math.cos(theta);
+                templates.asteroid.pos[ix+1] = rAst * Math.cos(phi);
+                templates.asteroid.pos[ix+2] = rAst * Math.sin(phi) * Math.sin(theta);
+                
+                new THREE.Color(0xffeedd).toArray(templates.asteroid.col, ix); // White hot core
+            } else { 
+                // Fiery Tail (Trailing to the left)
+                let xPos = 15 - (Math.random() * 40); // Tail spans from x=15 back to x=-25
+                let distFromCore = 15 - xPos;
+                // Tail spreads out slightly then dissipates
+                let rTail = (Math.random() * distFromCore * 0.4) + (Math.random() * 2);
+                let aTail = Math.random() * Math.PI * 2;
+                
+                templates.asteroid.pos[ix] = xPos;
+                templates.asteroid.pos[ix+1] = rTail * Math.cos(aTail);
+                templates.asteroid.pos[ix+2] = rTail * Math.sin(aTail);
+                
+                // Colors cool down as they get further from the core
+                let heat = Math.max(0, 1.0 - (distFromCore / 40));
+                new THREE.Color().setHSL(0.05 + (heat*0.05), 1.0, heat * 0.6).toArray(templates.asteroid.col, ix);
+            }
+
+            // --- SATURN ---
+            let uS = Math.random(), vS = Math.random();
+            let thetaS = uS * 2.0 * Math.PI;
+            let phiS = Math.acos(2.0 * vS - 1.0);
+            if (i < PARTICLE_COUNT * 0.4) {
+                let rS = 8;
+                templates.saturn.pos[ix] = rS * Math.sin(phiS) * Math.cos(thetaS);
+                templates.saturn.pos[ix+1] = rS * Math.cos(phiS);
+                templates.saturn.pos[ix+2] = rS * Math.sin(phiS) * Math.sin(thetaS);
+                new THREE.Color(0xeebb77).toArray(templates.saturn.col, ix);
+            } else {
+                let rRing = 11 + Math.random() * 12;
+                let aRing = Math.random() * Math.PI * 2;
+                templates.saturn.pos[ix] = rRing * Math.cos(aRing);
+                templates.saturn.pos[ix+1] = (Math.random() - 0.5) * 0.5;
+                templates.saturn.pos[ix+2] = rRing * Math.sin(aRing);
+                new THREE.Color(0xaa9977).lerp(new THREE.Color(0xddccaa), Math.random()).toArray(templates.saturn.col, ix);
+            }
+
+            // --- BLACK HOLE ---
+            if (i < PARTICLE_COUNT * 0.8) { 
+                let rDisk = 6 + Math.pow(Math.random(), 2) * 18; 
+                let aDisk = Math.random() * Math.PI * 2;
+                templates.blackhole.pos[ix] = rDisk * Math.cos(aDisk);
+                templates.blackhole.pos[ix+1] = (Math.random() - 0.5) * (rDisk * 0.1);
+                templates.blackhole.pos[ix+2] = rDisk * Math.sin(aDisk);
+                new THREE.Color(0xff4400).lerp(new THREE.Color(0xffaa00), 1 - (rDisk/24)).toArray(templates.blackhole.col, ix);
+            } else { 
+                let isTop = Math.random() > 0.5 ? 1 : -1;
+                let jetH = Math.random() * 30 * isTop;
+                let jetR = Math.random() * 2 * (1 + Math.abs(jetH)*0.1); 
+                let jetA = Math.random() * Math.PI * 2;
+                templates.blackhole.pos[ix] = jetR * Math.cos(jetA);
+                templates.blackhole.pos[ix+1] = jetH;
+                templates.blackhole.pos[ix+2] = jetR * Math.sin(jetA);
+                new THREE.Color(0xaa88ff).toArray(templates.blackhole.col, ix);
+            }
+        }
+
+        // Initialize with Volcano
+        currentPositions.set(templates.volcano.pos);
+        currentColors.set(templates.volcano.col);
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(currentPositions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(currentColors, 3));
+
+        const material = new THREE.PointsMaterial({ 
+            size: 0.25, 
+            vertexColors: true, 
+            blending: THREE.AdditiveBlending, 
+            depthWrite: false,
+            transparent: true,
+            opacity: 0.9
+        });
+        const particleSystem = new THREE.Points(geometry, material);
+        scene.add(particleSystem);
+
+        // --- 3. MEDIAPIPE HAND TRACKING SETUP ---
+        let handLandmarker = null;
+        let webcamRunning = false;
+        const video = document.getElementById('video');
+        const statusText = document.getElementById('status');
+        const shapeText = document.getElementById('shape-name');
+
+        async function initHandTracking() {
+            const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm");
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+            
+            navigator.mediaDevices.getUserMedia({ video: true }).then((stream) => {
+                video.srcObject = stream;
+                video.addEventListener("loadeddata", () => {
+                    webcamRunning = true;
+                    statusText.innerText = "Online - Awaiting Gestures";
+                });
+            });
+        }
+        initHandTracking();
+
+        // --- 4. GESTURE LOGIC ---
+        let currentShape = 'volcano';
+        let targetShape = templates.volcano;
+        let expansionMultiplier = 1.0;
+
+        function distance(p1, p2) {
+            return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+        }
+
+        function analyzeHand(landmarks) {
+            // Pinch to scale the effect
+            const pinchDist = distance(landmarks[4], landmarks[8]);
+            let targetExpansion = Math.max(0.5, Math.min(3.0, (pinchDist - 0.02) * 15));
+            expansionMultiplier += (targetExpansion - expansionMultiplier) * 0.1;
+
+            // Count open fingers
+            const tips = [8, 12, 16, 20];
+            const pips = [6, 10, 14, 18];
+            let openFingers = 0;
+            
+            for (let i = 0; i < 4; i++) {
+                if (distance(landmarks[tips[i]], landmarks[0]) > distance(landmarks[pips[i]], landmarks[0])) {
+                    openFingers++;
+                }
+            }
+
+            if (openFingers === 1 && currentShape !== 'volcano') { 
+                currentShape = 'volcano'; targetShape = templates.volcano; shapeText.innerText = "Volcano";
+            } else if (openFingers === 2 && currentShape !== 'asteroid') { 
+                currentShape = 'asteroid'; targetShape = templates.asteroid; shapeText.innerText = "Firing Asteroid";
+            } else if (openFingers === 3 && currentShape !== 'saturn') { 
+                currentShape = 'saturn'; targetShape = templates.saturn; shapeText.innerText = "Saturn"; 
+            } else if (openFingers >= 4 && currentShape !== 'blackhole') { 
+                currentShape = 'blackhole'; targetShape = templates.blackhole; shapeText.innerText = "Black Hole"; 
+            }
+        }
+
+        // --- 5. ANIMATION LOOP ---
+        let lastVideoTime = -1;
+        
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (webcamRunning && video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                const results = handLandmarker.detectForVideo(video, performance.now());
+                if (results.landmarks.length > 0) {
+                    analyzeHand(results.landmarks[0]);
+                }
+            }
+
+            // Object-specific Rotations
+            if (currentShape === 'volcano') {
+                particleSystem.rotation.y += 0.005; 
+                particleSystem.rotation.x += (0.1 - particleSystem.rotation.x) * 0.05; // Keep mostly upright
+            } else if (currentShape === 'asteroid') {
+                particleSystem.rotation.y = 0; // Don't spin the tail randomly
+                particleSystem.rotation.x += 0.02; // Spin the asteroid core like it's tumbling
+            } else {
+                particleSystem.rotation.y += 0.002;
+                particleSystem.rotation.x += (0.2 - particleSystem.rotation.x) * 0.05;
+            }
+
+            // Morphing Magic (Lerping)
+            const positions = geometry.attributes.position.array;
+            const colors = geometry.attributes.color.array;
+            const targetPos = targetShape.pos;
+            const targetCol = targetShape.col;
+
+            for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
+                positions[i] += ((targetPos[i] * expansionMultiplier) - positions[i]) * 0.06;
+                colors[i] += (targetCol[i] - colors[i]) * 0.06;
+            }
+
+            geometry.attributes.position.needsUpdate = true;
+            geometry.attributes.color.needsUpdate = true;
+
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
